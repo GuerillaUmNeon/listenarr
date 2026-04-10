@@ -8,7 +8,17 @@ from urllib3.util.retry import Retry
 load_dotenv()
 
 TIMEOUT = (5, 30)
-ALLOWED_RANGES = {"all_time", "month", "week", "year"}
+ALLOWED_RANGES = {
+    "this_week",
+    "this_month",
+    "this_year",
+    "week",
+    "month",
+    "quarter",
+    "year",
+    "half_yearly",
+    "all_time",
+}
 
 
 def require_env(name: str) -> str:
@@ -16,6 +26,25 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def get_int_env(name: str, default: int) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        return int(value)
+    except ValueError:
+        raise RuntimeError(
+            f"Environment variable {name} must be an integer, got: {value}"
+        )
+
+
+def get_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise RuntimeError(f"Environment variable {name} must be a boolean, got: {value}")
 
 
 def build_session() -> requests.Session:
@@ -41,7 +70,7 @@ def lidarr_headers(api_key: str) -> dict:
     }
 
 
-def get_excluded_artists(session, lidarr_url, api_key) -> set[str]:
+def get_excluded_artists(session: requests.Session, lidarr_url: str, api_key: str) -> set[str]:
     url = f"{lidarr_url.rstrip('/')}/api/v1/importlistexclusion"
     response = session.get(url, headers=lidarr_headers(api_key), timeout=TIMEOUT)
     response.raise_for_status()
@@ -52,7 +81,7 @@ def get_excluded_artists(session, lidarr_url, api_key) -> set[str]:
     }
 
 
-def get_existing_artists(session, lidarr_url, api_key) -> set[str]:
+def get_existing_artists(session: requests.Session, lidarr_url: str, api_key: str) -> set[str]:
     url = f"{lidarr_url.rstrip('/')}/api/v1/artist"
     response = session.get(url, headers=lidarr_headers(api_key), timeout=TIMEOUT)
     response.raise_for_status()
@@ -64,18 +93,18 @@ def get_existing_artists(session, lidarr_url, api_key) -> set[str]:
 
 
 def add_artist_to_lidarr(
-    session,
-    lidarr_url,
-    api_key,
-    mbid,
-    artist_name,
-    root_folder,
-    excluded_artists,
-    existing_artists,
-    quality_profile_id=1,
-    metadata_profile_id=1,
-    search_for_missing_albums=False,
-):
+    session: requests.Session,
+    lidarr_url: str,
+    api_key: str,
+    mbid: str | None,
+    artist_name: str,
+    root_folder: str,
+    excluded_artists: set[str],
+    existing_artists: set[str],
+    quality_profile_id: int,
+    metadata_profile_id: int,
+    search_for_missing_albums: bool,
+) -> bool:
     if not mbid:
         print(f"Skipping {artist_name}: missing MBID")
         return False
@@ -121,9 +150,17 @@ def add_artist_to_lidarr(
     return False
 
 
-def get_top_artists(session, username, time_range, count, min_listen):
+def get_top_artists(
+    session: requests.Session,
+    username: str,
+    time_range: str,
+    count: int,
+    min_listen: int,
+) -> list[dict]:
     if time_range not in ALLOWED_RANGES:
-        raise ValueError(f"Invalid time_range: {time_range}. Allowed: {sorted(ALLOWED_RANGES)}")
+        raise ValueError(
+            f"Invalid TIME_RANGE: {time_range}. Allowed: {sorted(ALLOWED_RANGES)}"
+        )
 
     url = f"https://api.listenbrainz.org/1/stats/user/{username}/artists"
     params = {
@@ -134,7 +171,8 @@ def get_top_artists(session, username, time_range, count, min_listen):
     response = session.get(url, params=params, timeout=TIMEOUT)
     response.raise_for_status()
 
-    artists = response.json()["payload"]["artists"]
+    data = response.json()
+    artists = data["payload"]["artists"]
 
     filtered = []
     seen_mbids = set()
@@ -143,7 +181,7 @@ def get_top_artists(session, username, time_range, count, min_listen):
         mbid = artist.get("artist_mbid")
         listens = artist.get("listen_count", 0)
 
-        if listens <= min_listen:
+        if listens < min_listen:
             continue
         if not mbid:
             continue
@@ -156,16 +194,20 @@ def get_top_artists(session, username, time_range, count, min_listen):
     return filtered
 
 
-def main():
+def main() -> None:
     lidarr_url = require_env("URL")
     api_key = require_env("API")
     root_folder = require_env("ROOT_FOLDER")
     username = require_env("USERNAME")
 
-    time_range = "week"
-    count = 50
-    min_listen = 5
-    add_excluded_artists = False
+    time_range = os.getenv("TIME_RANGE", "week")
+    count = get_int_env("COUNT", 50)
+    min_listen = get_int_env("MIN_LISTEN", 5)
+    add_excluded_artists = get_bool_env("ADD_EXCLUDED_ARTISTS", False)
+
+    quality_profile_id = get_int_env("QUALITY_PROFILE_ID", 1)
+    metadata_profile_id = get_int_env("METADATA_PROFILE_ID", 1)
+    search_for_missing_albums = get_bool_env("SEARCH_FOR_MISSING_ALBUMS", False)
 
     session = build_session()
 
@@ -189,6 +231,9 @@ def main():
             root_folder=root_folder,
             excluded_artists=excluded_artists,
             existing_artists=existing_artists,
+            quality_profile_id=quality_profile_id,
+            metadata_profile_id=metadata_profile_id,
+            search_for_missing_albums=search_for_missing_albums,
         )
         if added_ok:
             added += 1
