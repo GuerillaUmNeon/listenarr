@@ -1,78 +1,206 @@
-import requests
 import os
+import sys
+import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 load_dotenv()
 
+TIMEOUT = (5, 30)
+ALLOWED_RANGES = {"all_time", "month", "week", "year"}
 
-def get_excluded_artists(lidarr_url, api_key):
-    headers = {
-        'X-Api-Key': api_key,
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def build_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def lidarr_headers(api_key: str) -> dict:
+    return {
+        "X-Api-Key": api_key,
+        "Content-Type": "application/json",
     }
-    response = requests.get(f'{lidarr_url}/api/v1/importlistexclusion', headers=headers)
-    if response.status_code == 200:
-        return [exclusion['foreignId'] for exclusion in response.json()]
-    else:
-        print(f"Failed to fetch exclusion list. Status code: {response.status_code}")
-        return []
 
-def add_artist_to_lidarr(lidarr_url, api_key, mbid, artist_name, root_folder, excluded_artists):
+
+def get_excluded_artists(session, lidarr_url, api_key) -> set[str]:
+    url = f"{lidarr_url.rstrip('/')}/api/v1/importlistexclusion"
+    response = session.get(url, headers=lidarr_headers(api_key), timeout=TIMEOUT)
+    response.raise_for_status()
+    return {
+        item.get("foreignId")
+        for item in response.json()
+        if item.get("foreignId")
+    }
+
+
+def get_existing_artists(session, lidarr_url, api_key) -> set[str]:
+    url = f"{lidarr_url.rstrip('/')}/api/v1/artist"
+    response = session.get(url, headers=lidarr_headers(api_key), timeout=TIMEOUT)
+    response.raise_for_status()
+    return {
+        item.get("foreignArtistId")
+        for item in response.json()
+        if item.get("foreignArtistId")
+    }
+
+
+def add_artist_to_lidarr(
+    session,
+    lidarr_url,
+    api_key,
+    mbid,
+    artist_name,
+    root_folder,
+    excluded_artists,
+    existing_artists,
+    quality_profile_id=1,
+    metadata_profile_id=1,
+    search_for_missing_albums=False,
+):
+    if not mbid:
+        print(f"Skipping {artist_name}: missing MBID")
+        return False
+
     if mbid in excluded_artists:
-        print(f"Skipping excluded artist: {artist_name} (MBID: {mbid})")
-        return
+        print(f"Skipping excluded artist: {artist_name} ({mbid})")
+        return False
 
-    headers = {
-        'X-Api-Key': api_key,
-        'Content-Type': 'application/json'
-    }
+    if mbid in existing_artists:
+        print(f"Skipping existing artist: {artist_name} ({mbid})")
+        return False
 
     payload = {
-        'foreignArtistId': mbid,
-        'artistName': artist_name,
-        'rootFolderPath': root_folder,
-        'monitored': True,
-        'qualityProfileId': 1,
-        'metadataProfileId': 1,
+        "foreignArtistId": mbid,
+        "artistName": artist_name,
+        "rootFolderPath": root_folder,
+        "monitored": True,
+        "qualityProfileId": quality_profile_id,
+        "metadataProfileId": metadata_profile_id,
         "addOptions": {
-            "searchForMissingAlbums": False     # set as True if you want to search for the missing albums on add
+            "searchForMissingAlbums": search_for_missing_albums
         },
     }
 
-
-    response = requests.post(f'{lidarr_url}/api/v1/artist', headers=headers, json=payload)
+    url = f"{lidarr_url.rstrip('/')}/api/v1/artist"
+    response = session.post(
+        url,
+        headers=lidarr_headers(api_key),
+        json=payload,
+        timeout=TIMEOUT,
+    )
 
     if response.status_code == 201:
-        print(f"Successfully added artist: {artist_name} (MBID: {mbid})")
+        print(f"Added artist: {artist_name} ({mbid})")
+        existing_artists.add(mbid)
+        return True
 
-def get_top_artists(username, range, count, min_listen):
+    if response.status_code == 400:
+        print(f"Bad request for {artist_name} ({mbid}): {response.text}")
+        return False
+
+    response.raise_for_status()
+    return False
+
+
+def get_top_artists(session, username, time_range, count, min_listen):
+    if time_range not in ALLOWED_RANGES:
+        raise ValueError(f"Invalid time_range: {time_range}. Allowed: {sorted(ALLOWED_RANGES)}")
+
     url = f"https://api.listenbrainz.org/1/stats/user/{username}/artists"
     params = {
-        'range': range,
-        'count': count
+        "range": time_range,
+        "count": min(count, 100),
     }
 
-    response = requests.get(url, params=params)
+    response = session.get(url, params=params, timeout=TIMEOUT)
     response.raise_for_status()
 
-    data = response.json()
-    artists = data['payload']['artists']
+    artists = response.json()["payload"]["artists"]
 
-    return [artist for artist in artists if artist['listen_count'] > min_listen]
+    filtered = []
+    seen_mbids = set()
 
-# Configuration
-lidarr_url = os.getenv("URL")
-api_key = os.getenv("API")
-root_folder = os.getenv("ROOT_FOLDER")
-username = os.getenv("USERNAME")
-range = 'week'                          # 'this_week', 'this_month', 'this_year', 'week', 'month', 'quarter', 'year', 'half_yearly', 'all_time'
-count = 50                              # number of artists to return
-min_listen = 5                          # set the minimum listen for artists within the range
-add_excluded_artists = False             # set to True if you want to add artists even if they are on the Import List Exclusions
+    for artist in artists:
+        mbid = artist.get("artist_mbid")
+        listens = artist.get("listen_count", 0)
+
+        if listens <= min_listen:
+            continue
+        if not mbid:
+            continue
+        if mbid in seen_mbids:
+            continue
+
+        seen_mbids.add(mbid)
+        filtered.append(artist)
+
+    return filtered
 
 
-excluded_artists = get_excluded_artists(lidarr_url, api_key) if not add_excluded_artists else []
+def main():
+    lidarr_url = require_env("URL")
+    api_key = require_env("API")
+    root_folder = require_env("ROOT_FOLDER")
+    username = require_env("USERNAME")
 
-artists = get_top_artists(username, range, count, min_listen)
+    time_range = "week"
+    count = 50
+    min_listen = 5
+    add_excluded_artists = False
 
-for artist in artists:
-    add_artist_to_lidarr(lidarr_url, api_key, artist['artist_mbid'], artist['artist_name'], root_folder, excluded_artists)
+    session = build_session()
 
+    excluded_artists = set()
+    if not add_excluded_artists:
+        excluded_artists = get_excluded_artists(session, lidarr_url, api_key)
+
+    existing_artists = get_existing_artists(session, lidarr_url, api_key)
+    artists = get_top_artists(session, username, time_range, count, min_listen)
+
+    added = 0
+    skipped = 0
+
+    for artist in artists:
+        added_ok = add_artist_to_lidarr(
+            session=session,
+            lidarr_url=lidarr_url,
+            api_key=api_key,
+            mbid=artist.get("artist_mbid"),
+            artist_name=artist.get("artist_name", "Unknown Artist"),
+            root_folder=root_folder,
+            excluded_artists=excluded_artists,
+            existing_artists=existing_artists,
+        )
+        if added_ok:
+            added += 1
+        else:
+            skipped += 1
+
+    print(f"Done. Added: {added}, skipped: {skipped}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
