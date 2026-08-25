@@ -36,13 +36,13 @@ ALLOWED_RANGES = {
 }
 ALLOWED_SOURCES = {"koito", "listenbrainz"}
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("listenarr")
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 
 def require_env(name: str) -> str:
@@ -60,7 +60,6 @@ def get_int_env(name: str, default: int) -> int:
         raise RuntimeError(
             f"Environment variable {name} must be an integer, got: {value}"
         ) from exc
-
     if result < 1:
         raise RuntimeError(f"Environment variable {name} must be greater than 0")
     return result
@@ -89,7 +88,6 @@ def get_source_env() -> str:
 
 def build_session() -> requests.Session:
     session = requests.Session()
-
     retry = Retry(
         total=3,
         connect=3,
@@ -99,12 +97,11 @@ def build_session() -> requests.Session:
         allowed_methods=["GET", "POST"],
         respect_retry_after_header=True,
     )
-
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-
     return session
+
 
 def lidarr_headers(api_key: str) -> dict[str, str]:
     return {
@@ -133,14 +130,9 @@ def get_excluded_artists(
         timeout=TIMEOUT,
     )
     response.raise_for_status()
-
     data = response.json()
-
     if not isinstance(data, list):
-        raise RuntimeError(
-            f"Unexpected Lidarr exclusion response: {data}"
-        )
-
+        raise RuntimeError(f"Unexpected Lidarr exclusion response: {data}")
     return {
         str(item["foreignId"])
         for item in data
@@ -159,14 +151,9 @@ def get_existing_artists(
         timeout=TIMEOUT,
     )
     response.raise_for_status()
-
     data = response.json()
-
     if not isinstance(data, list):
-        raise RuntimeError(
-            f"Unexpected Lidarr artist response: {data}"
-        )
-
+        raise RuntimeError(f"Unexpected Lidarr artist response: {data}")
     return {
         str(item["foreignArtistId"])
         for item in data
@@ -181,7 +168,6 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-
     if result.tzinfo is None:
         result = result.replace(tzinfo=timezone.utc)
     return result.astimezone(timezone.utc)
@@ -190,7 +176,6 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
 def parse_timestamp(value: Any) -> datetime | None:
     if value is None:
         return None
-
     if isinstance(value, (int, float)):
         timestamp = float(value)
         if timestamp > 10_000_000_000:
@@ -199,16 +184,13 @@ def parse_timestamp(value: Any) -> datetime | None:
             return datetime.fromtimestamp(timestamp, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
             return None
-
     if isinstance(value, str):
         value = value.strip()
         if not value:
             return None
-
         parsed = parse_iso_datetime(value)
         if parsed:
             return parsed
-
         try:
             timestamp = float(value)
             if timestamp > 10_000_000_000:
@@ -216,13 +198,11 @@ def parse_timestamp(value: Any) -> datetime | None:
             return datetime.fromtimestamp(timestamp, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
             return None
-
     return None
 
 
 def get_cutoff(time_range: str) -> datetime | None:
     now = datetime.now(timezone.utc)
-
     if time_range in {"week", "this_week"}:
         return now - timedelta(days=7)
     if time_range in {"month", "this_month"}:
@@ -235,7 +215,6 @@ def get_cutoff(time_range: str) -> datetime | None:
         return now - timedelta(days=365)
     if time_range == "all_time":
         return None
-
     raise ValueError(
         f"Invalid TIME_RANGE: {time_range}. "
         f"Allowed: {sorted(ALLOWED_RANGES)}"
@@ -252,150 +231,162 @@ def lookup_artist_mbid(
     cache: dict[str, str | None],
 ) -> str | None:
     normalized_name = artist_name.strip().casefold()
-
     if normalized_name in cache:
         return cache[normalized_name]
 
-    url = "https://musicbrainz.org/ws/2/artist"
-    params = {
-        "query": f'artist:"{artist_name}"',
-        "fmt": "json",
-        "limit": 10,
-    }
-    headers = {
-        "User-Agent": "listenarr/1.0 (personal music automation)",
-        "Accept": "application/json",
-    }
-
-    max_attempts = 3
-
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, 4):
         try:
-            logger.info(
-                "MusicBrainz lookup %d/%d: %s",
-                attempt,
-                max_attempts,
-                artist_name,
-            )
-
             response = session.get(
-                url,
-                params=params,
-                headers=headers,
+                "https://musicbrainz.org/ws/2/artist",
+                params={
+                    "query": f'artist:"{artist_name}"',
+                    "fmt": "json",
+                    "limit": 10,
+                },
+                headers={
+                    "User-Agent": (
+                        "listenarr/1.0 "
+                        "(personal music automation)"
+                    ),
+                    "Accept": "application/json",
+                },
                 timeout=TIMEOUT,
             )
 
             if response.status_code == 503:
-                if attempt == max_attempts:
-                    logger.error(
-                        "MusicBrainz still unavailable after %d attempts: %s",
-                        max_attempts,
+                if attempt < 3:
+                    logger.warning(
+                        "MusicBrainz returned 503 for %s; "
+                        "retrying in 60 seconds (%d/3)",
                         artist_name,
+                        attempt + 1,
                     )
-                    cache[normalized_name] = None
-                    return None
-
-                logger.warning(
-                    "MusicBrainz returned 503 for %s. "
-                    "Waiting 30 seconds before retry %d/%d.",
-                    artist_name,
-                    attempt + 1,
-                    max_attempts,
-                )
-
-                time.sleep(30)
-                continue
+                    time.sleep(60)
+                    continue
+                cache[normalized_name] = None
+                return None
 
             response.raise_for_status()
-            data = response.json()
+            results = response.json().get("artists", [])
             break
 
         except requests.Timeout as exc:
-            if attempt == max_attempts:
-                logger.error(
-                    "MusicBrainz timed out after %d attempts for %s: %s",
-                    max_attempts,
+            if attempt < 3:
+                logger.warning(
+                    "MusicBrainz timeout for %s; "
+                    "retrying in 60 seconds (%d/3): %s",
                     artist_name,
+                    attempt + 1,
                     exc,
                 )
-                cache[normalized_name] = None
-                return None
-
-            logger.warning(
-                "MusicBrainz timeout for %s. "
-                "Waiting 30 seconds before retry %d/%d.",
-                artist_name,
-                attempt + 1,
-                max_attempts,
-            )
-
-            time.sleep(30)
+                time.sleep(60)
+                continue
+            cache[normalized_name] = None
+            return None
 
         except requests.RequestException as exc:
-            if attempt == max_attempts:
-                logger.error(
-                    "MusicBrainz request failed after %d attempts for %s: %s",
-                    max_attempts,
+            if attempt < 3:
+                logger.warning(
+                    "MusicBrainz request failed for %s; "
+                    "retrying in 60 seconds (%d/3): %s",
                     artist_name,
+                    attempt + 1,
                     exc,
                 )
-                cache[normalized_name] = None
-                return None
-
-            logger.warning(
-                "MusicBrainz request failed for %s: %s. "
-                "Waiting 30 seconds before retry %d/%d.",
-                artist_name,
-                exc,
-                attempt + 1,
-                max_attempts,
-            )
-
-            time.sleep(30)
-
+                time.sleep(60)
+                continue
+            cache[normalized_name] = None
+            return None
     else:
         cache[normalized_name] = None
         return None
 
-    results = data.get("artists", [])
+    normalized_results = [
+        artist
+        for artist in results
+        if isinstance(artist, dict)
+    ]
 
     exact_matches = [
         artist
-        for artist in results
+        for artist in normalized_results
         if artist.get("name", "").casefold() == normalized_name
     ]
 
-    candidates = exact_matches or results
+    candidates = exact_matches or normalized_results
     mbid = candidates[0].get("id") if candidates else None
 
     if not is_valid_mbid(mbid):
-        logger.warning(
-            "No valid MusicBrainz MBID found for %s",
-            artist_name,
-        )
         cache[normalized_name] = None
         return None
 
     cache[normalized_name] = mbid
-
-    # Keep normal successful requests at least one second apart.
     time.sleep(1.1)
-
     return mbid
+
+
+def get_koito_artist_mbid(
+    session: requests.Session,
+    koito_url: str,
+    koito_token: str,
+    koito_artist_id: int,
+    cache: dict[int, str | None],
+) -> str | None:
+    if koito_artist_id in cache:
+        return cache[koito_artist_id]
+
+    url = (
+        f"{koito_url.rstrip('/')}/apis/web/v1/artist/"
+        f"{koito_artist_id}"
+    )
+
+    try:
+        response = session.get(
+            url,
+            headers=token_headers(koito_token),
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        logger.warning(
+            "Koito artist lookup failed for ID %s: %s",
+            koito_artist_id,
+            exc,
+        )
+        cache[koito_artist_id] = None
+        return None
+
+    mbid = (
+        data.get("musicbrainz_id")
+        or data.get("musicbrainzId")
+        or data.get("mbid")
+    )
+
+    if not is_valid_mbid(mbid):
+        cache[koito_artist_id] = None
+        return None
+
+    cache[koito_artist_id] = mbid
+    return mbid
+
 
 def extract_artist_info(
     listen: dict[str, Any],
-) -> tuple[str | None, str | None, datetime | None]:
+) -> tuple[str | None, str | None, datetime | None, int | None]:
     listened_at = parse_timestamp(listen.get("time"))
     artist_name: str | None = None
     artist_mbid: str | None = None
+    koito_artist_id: int | None = None
 
     track = listen.get("track")
+
     if isinstance(track, dict):
         artists = track.get("artists")
 
         if isinstance(artists, list) and artists:
             first_artist = artists[0]
+
             if isinstance(first_artist, dict):
                 artist_name = (
                     first_artist.get("name")
@@ -403,10 +394,13 @@ def extract_artist_info(
                     or first_artist.get("artistName")
                 )
                 artist_mbid = (
-                    first_artist.get("mbid")
+                    first_artist.get("musicbrainz_id")
+                    or first_artist.get("musicbrainzId")
+                    or first_artist.get("mbid")
                     or first_artist.get("artist_mbid")
                     or first_artist.get("artistMbid")
                 )
+                koito_artist_id = first_artist.get("id")
 
         artist_name = (
             artist_name
@@ -415,6 +409,8 @@ def extract_artist_info(
         )
         artist_mbid = (
             artist_mbid
+            or track.get("musicbrainz_id")
+            or track.get("musicbrainzId")
             or track.get("artist_mbid")
             or track.get("artistMbid")
         )
@@ -426,14 +422,26 @@ def extract_artist_info(
     )
     artist_mbid = (
         artist_mbid
+        or listen.get("musicbrainz_id")
+        or listen.get("musicbrainzId")
         or listen.get("artist_mbid")
         or listen.get("artistMbid")
     )
+
+    try:
+        koito_artist_id = (
+            int(koito_artist_id)
+            if koito_artist_id is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        koito_artist_id = None
 
     return (
         str(artist_name) if artist_name else None,
         str(artist_mbid) if artist_mbid else None,
         listened_at,
+        koito_artist_id,
     )
 
 
@@ -468,7 +476,10 @@ def fetch_recent_koito_listens(
         response = session.get(
             url,
             headers=token_headers(koito_token),
-            params={"page": page, "period": time_range},
+            params={
+                "page": page,
+                "period": time_range,
+            },
             timeout=TIMEOUT,
         )
         response.raise_for_status()
@@ -483,20 +494,15 @@ def fetch_recent_koito_listens(
         page += 1
 
     if cutoff is None:
-        logger.info("Using all %d Koito listens", len(listens))
         return listens
 
     filtered: list[dict[str, Any]] = []
+
     for listen in listens:
         listened_at = extract_artist_info(listen)[2]
         if listened_at is None or listened_at >= cutoff:
             filtered.append(listen)
 
-    logger.info(
-        "Kept %d of %d Koito listens after time filtering",
-        len(filtered),
-        len(listens),
-    )
     return filtered
 
 
@@ -518,12 +524,16 @@ def get_top_artists_from_koito(
         time_range=time_range,
     )
 
-    logger.info("Counting artists from %d listens", len(listens))
     name_counter: Counter[str] = Counter()
     names_display: dict[str, str] = {}
+    koito_ids: dict[str, int] = {}
+    inline_mbids: dict[str, str] = {}
 
     for listen in listens:
-        artist_name, _, _ = extract_artist_info(listen)
+        artist_name, artist_mbid, _, koito_artist_id = extract_artist_info(
+            listen
+        )
+
         if not artist_name:
             continue
 
@@ -531,38 +541,45 @@ def get_top_artists_from_koito(
         name_counter[normalized_name] += 1
         names_display[normalized_name] = artist_name
 
-    logger.info("Found %d unique artist names", len(name_counter))
+        if koito_artist_id is not None:
+            koito_ids[normalized_name] = koito_artist_id
 
-    mbid_cache: dict[str, str | None] = {}
+        if is_valid_mbid(artist_mbid):
+            inline_mbids[normalized_name] = artist_mbid
+
+    koito_mbid_cache: dict[int, str | None] = {}
+    musicbrainz_mbid_cache: dict[str, str | None] = {}
     counter: Counter[str] = Counter()
     names_by_mbid: dict[str, str] = {}
-    eligible = [
+
+    eligible_artists = [
         item
         for item in name_counter.most_common()
         if item[1] >= min_listen
     ]
 
-    logger.info(
-        "%d artists meet MIN_LISTEN=%d; resolving MusicBrainz IDs",
-        len(eligible),
-        min_listen,
-    )
-
-    for index, (normalized_name, listen_count) in enumerate(eligible, 1):
+    for normalized_name, listen_count in eligible_artists:
         artist_name = names_display[normalized_name]
-        logger.info(
-            "Resolving artist %d/%d: %s (%d listens)",
-            index,
-            len(eligible),
-            artist_name,
-            listen_count,
-        )
+        artist_mbid = inline_mbids.get(normalized_name)
 
-        artist_mbid = lookup_artist_mbid(
-            session=session,
-            artist_name=artist_name,
-            cache=mbid_cache,
-        )
+        if not artist_mbid:
+            koito_artist_id = koito_ids.get(normalized_name)
+
+            if koito_artist_id is not None:
+                artist_mbid = get_koito_artist_mbid(
+                    session=session,
+                    koito_url=koito_url,
+                    koito_token=koito_token,
+                    koito_artist_id=koito_artist_id,
+                    cache=koito_mbid_cache,
+                )
+
+        if not artist_mbid:
+            artist_mbid = lookup_artist_mbid(
+                session=session,
+                artist_name=artist_name,
+                cache=musicbrainz_mbid_cache,
+            )
 
         if not artist_mbid:
             continue
@@ -570,7 +587,7 @@ def get_top_artists_from_koito(
         counter[artist_mbid] = listen_count
         names_by_mbid[artist_mbid] = artist_name
 
-    result = [
+    return [
         {
             "artist_mbid": artist_mbid,
             "artist_name": names_by_mbid[artist_mbid],
@@ -578,9 +595,6 @@ def get_top_artists_from_koito(
         }
         for artist_mbid, listen_count in counter.most_common(count)
     ]
-
-    logger.info("Resolved %d artists to MusicBrainz IDs", len(result))
-    return result
 
 
 def get_top_artists_from_listenbrainz(
@@ -591,8 +605,6 @@ def get_top_artists_from_listenbrainz(
     min_listen: int,
     token: str | None = None,
 ) -> list[dict[str, Any]]:
-    logger.info("Fetching top artists from ListenBrainz")
-
     if time_range not in ALLOWED_RANGES:
         raise ValueError(
             f"Invalid TIME_RANGE: {time_range}. "
@@ -601,7 +613,10 @@ def get_top_artists_from_listenbrainz(
 
     response = session.get(
         f"https://api.listenbrainz.org/1/stats/user/{username}/artists",
-        params={"range": time_range, "count": min(count, 100)},
+        params={
+            "range": time_range,
+            "count": min(count, 100),
+        },
         headers=token_headers(token) if token else {},
         timeout=TIMEOUT,
     )
@@ -622,12 +637,14 @@ def get_top_artists_from_listenbrainz(
         result.append(
             {
                 "artist_mbid": mbid,
-                "artist_name": artist.get("artist_name", "Unknown Artist"),
+                "artist_name": artist.get(
+                    "artist_name",
+                    "Unknown Artist",
+                ),
                 "listen_count": listen_count,
             }
         )
 
-    logger.info("ListenBrainz returned %d artists", len(result))
     return result
 
 
@@ -675,15 +692,8 @@ def add_artist_to_lidarr(
     metadata_profile_id: int,
     search_for_missing_albums: bool,
 ) -> bool:
-    if mbid in excluded_artists:
-        logger.info("Skipping excluded artist: %s", artist_name)
+    if mbid in excluded_artists or mbid in existing_artists:
         return False
-
-    if mbid in existing_artists:
-        logger.info("Skipping existing artist: %s", artist_name)
-        return False
-
-    logger.info("Adding artist to Lidarr: %s", artist_name)
 
     response = session.post(
         f"{lidarr_url.rstrip('/')}/api/v1/artist",
@@ -704,7 +714,6 @@ def add_artist_to_lidarr(
 
     if response.status_code in {200, 201}:
         existing_artists.add(mbid)
-        logger.info("Added artist to Lidarr: %s", artist_name)
         return True
 
     if response.status_code == 400:
@@ -718,33 +727,20 @@ def add_artist_to_lidarr(
     response.raise_for_status()
     return False
 
+
 def main() -> None:
     logger.info("Starting Listenarr")
 
     lidarr_url = require_env("URL")
     api_key = require_env("API")
     root_folder = require_env("ROOT_FOLDER")
-
     source = get_source_env()
     time_range = os.getenv("TIME_RANGE", "week").strip().lower()
     count = get_int_env("COUNT", 50)
     min_listen = get_int_env("MIN_LISTEN", 5)
-
-    add_excluded_artists = get_bool_env(
-        "ADD_EXCLUDED_ARTISTS",
-        False,
-    )
-
-    quality_profile_id = get_int_env(
-        "QUALITY_PROFILE_ID",
-        1,
-    )
-
-    metadata_profile_id = get_int_env(
-        "METADATA_PROFILE_ID",
-        1,
-    )
-
+    add_excluded_artists = get_bool_env("ADD_EXCLUDED_ARTISTS", False)
+    quality_profile_id = get_int_env("QUALITY_PROFILE_ID", 1)
+    metadata_profile_id = get_int_env("METADATA_PROFILE_ID", 1)
     search_for_missing_albums = get_bool_env(
         "SEARCH_FOR_MISSING_ALBUMS",
         False,
@@ -756,20 +752,9 @@ def main() -> None:
             f"Allowed: {sorted(ALLOWED_RANGES)}"
         )
 
-    logger.info(
-        "Configuration: source=%s, range=%s, count=%d, min_listen=%d",
-        source,
-        time_range,
-        count,
-        min_listen,
-    )
-
     session = build_session()
 
-    logger.info("Connecting to Lidarr")
-
     excluded_artists: set[str] = set()
-
     if not add_excluded_artists:
         excluded_artists = get_excluded_artists(
             session=session,
@@ -791,92 +776,40 @@ def main() -> None:
         min_listen=min_listen,
     )
 
-    logger.info(
-        "Artists ready for Lidarr: %d",
-        len(artists),
-    )
-
     added = 0
     skipped = 0
 
+    logger.info(
+        "Processing %d artists",
+        len(artists),
+    )
+
     for index, artist in enumerate(artists, start=1):
-        artist_name = artist.get(
-            "artist_name",
-            "Unknown Artist",
+        added_ok = add_artist_to_lidarr(
+            session=session,
+            lidarr_url=lidarr_url,
+            api_key=api_key,
+            mbid=artist["artist_mbid"],
+            artist_name=artist["artist_name"],
+            root_folder=root_folder,
+            excluded_artists=excluded_artists,
+            existing_artists=existing_artists,
+            quality_profile_id=quality_profile_id,
+            metadata_profile_id=metadata_profile_id,
+            search_for_missing_albums=search_for_missing_albums,
         )
-
-        artist_mbid = artist.get("artist_mbid")
-
-        logger.info(
-            "Processing artist %d/%d: %s",
-            index,
-            len(artists),
-            artist_name,
-        )
-
-        if not artist_mbid:
-            logger.warning(
-                "Skipping %s because it has no MBID",
-                artist_name,
-            )
-            skipped += 1
-            continue
-
-        try:
-            added_ok = add_artist_to_lidarr(
-                session=session,
-                lidarr_url=lidarr_url,
-                api_key=api_key,
-                mbid=artist_mbid,
-                artist_name=artist_name,
-                root_folder=root_folder,
-                excluded_artists=excluded_artists,
-                existing_artists=existing_artists,
-                quality_profile_id=quality_profile_id,
-                metadata_profile_id=metadata_profile_id,
-                search_for_missing_albums=search_for_missing_albums,
-            )
-
-        except requests.RequestException as exc:
-            logger.exception(
-                "Lidarr request failed for %s: %s",
-                artist_name,
-                exc,
-            )
-            added_ok = False
 
         if added_ok:
             added += 1
-            logger.info(
-                "Progress: %d/%d processed, %d added, %d skipped",
-                index,
-                len(artists),
-                added,
-                skipped,
-            )
         else:
             skipped += 1
-            logger.info(
-                "Progress: %d/%d processed, %d added, %d skipped",
-                index,
-                len(artists),
-                added,
-                skipped,
-            )
-
-    logger.info(
-        "Finished: source=%s, artists=%d, added=%d, skipped=%d",
-        source,
-        len(artists),
-        added,
-        skipped,
-    )
 
     print(
         f"Done. Source: {source}. "
         f"Artists returned: {len(artists)}, "
         f"Added: {added}, skipped: {skipped}"
     )
+
 
 if __name__ == "__main__":
     try:
